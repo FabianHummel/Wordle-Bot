@@ -1,0 +1,5 @@
+.env
+__pycache__
+store
+device_id.json
+matrix-bot-env
