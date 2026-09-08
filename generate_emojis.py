@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 OUTPUT_DIR = Path("./emojis")
 TILE_SIZE = 128
 FONT_SIZE = 86
-FONT_PATH = Path("/System/Library/Fonts/SFNS.ttf")
+FONT_PATH = Path("./SFNS.ttf")
 
 COLORS = {
     "gray": "#5f6365",

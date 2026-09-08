@@ -26,3 +26,4 @@ rpds-py==2026.6.3
 unpaddedbase64==2.1.0
 vodozemac==0.10.0
 yarl==1.24.5
+Pillow
