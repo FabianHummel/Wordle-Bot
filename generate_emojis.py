@@ -27,9 +27,10 @@ def generate_emojis() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     font = load_font()
 
-    Image.new("RGB", (TILE_SIZE, TILE_SIZE), COLORS["gray"]).save(
-        OUTPUT_DIR / "empty_gray.png"
-    )
+    for state, background in COLORS.items():
+        Image.new("RGB", (TILE_SIZE, TILE_SIZE), background).save(
+            OUTPUT_DIR / f"empty_{state}.png"
+        )
 
     for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
         for state, background in COLORS.items():

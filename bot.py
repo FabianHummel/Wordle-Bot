@@ -67,11 +67,11 @@ accepted_words: set[str] | None = None
 emoji_media: dict[str, str] = {}
 
 
-async def fetch_today_answer() -> str:
+async def fetch_today_answer(force_refresh: bool = False) -> str:
     """Fetch and cache the answer for the current UTC calendar day."""
     global daily_answer
     today = datetime.now(timezone.utc).date()
-    if daily_answer and daily_answer[0] == today:
+    if not force_refresh and daily_answer and daily_answer[0] == today:
         return daily_answer[1]
 
     async with aiohttp.ClientSession() as session:
@@ -109,7 +109,7 @@ async def fetch_accepted_words() -> set[str]:
 
 async def upload_emojis() -> None:
     required = [f"{letter}_{state}.png" for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" for state in ("gray", "yellow", "green")]
-    required.append("empty_gray.png")
+    required.extend(["empty_gray.png", "empty_yellow.png", "empty_green.png"])
     missing = [name for name in required if not os.path.isfile(os.path.join(EMOJI_DIR, name))]
     if missing:
         raise FileNotFoundError(f"Missing emoji assets: {', '.join(missing)}")
@@ -173,6 +173,21 @@ def empty_emoji_html() -> str:
     )
 
 
+def empty_tile_emoji_name(state: Tile) -> str:
+    return f":empty_{state}:"
+
+
+def empty_tile_emoji_html(state: Tile) -> str:
+    name = empty_tile_emoji_name(state)
+    uri = emoji_media.get(name)
+    if not uri:
+        return name
+    return (
+        f'<img src="{uri}" alt="{name}" data-mx-emoticon="" '
+        f'width="{EMOJI_DISPLAY_SIZE}" height="{EMOJI_DISPLAY_SIZE}"/>'
+    )
+
+
 def render_grid(game: Game) -> str:
     return "\n".join(
         "".join(emoji_name(letter, state) for letter, state in zip(guess.word, guess.tiles))
@@ -187,17 +202,31 @@ def render_html_grid(game: Game) -> str:
     )
 
 
+def render_share_grid(game: Game) -> str:
+    return "\n".join(
+        "".join(empty_tile_emoji_name(state) for state in guess.tiles)
+        for guess in game.guesses
+    )
+
+
+def render_share_html_grid(game: Game) -> str:
+    return "<br>".join(
+        "".join(empty_tile_emoji_html(state) for state in guess.tiles)
+        for guess in game.guesses
+    )
+
+
 def render_share_message(game: Game, comment: str = "") -> tuple[str, str]:
     if game.winner:
         result = f"{game.winner} won today's Wordle in {guess_count_text(len(game.guesses))}!"
     else:
         result = f"Imagine failing today's Wordle, {game.loser or 'player'}"
-    grid = render_grid(game)
+    grid = render_share_grid(game)
     if comment:
         result += f' - "{comment}"'
     html_result = result.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html_result = html_result.replace('"', "&quot;")
-    return f"{result}\n\n{grid}", f"{html_result}<br><br>{render_html_grid(game)}"
+    return f"{result}\n\n{grid}", f"{html_result}<br><br>{render_share_html_grid(game)}"
 
 
 def load_device_id():
@@ -215,6 +244,14 @@ def save_device_id(device_id):
 async def message_callback(room: MatrixRoom, event: RoomMessageText):
     if event.sender == client.user_id:
         return
+    
+    # Check if the day has changed and refresh the daily answer if needed
+    global daily_answer
+    today = datetime.now(timezone.utc).date()
+    if daily_answer and daily_answer[0] != today:
+        daily_answer = None
+        games.clear()
+    
     print(f"[{room.display_name}] {event.sender}: {event.body}")
     if event.body.startswith("!touch"):
         await send(room.room_id, f"Hello {event.sender.split(':')[0]}, it is currently {time.ctime(time.time())}. Have a nice day!")
@@ -258,12 +295,10 @@ async def handle_guess(room_id: str, sender: str, body: str):
         game.finished = True
         game.winner = sender.split(":", 1)[0].lstrip("@")
         await send_completion(room_id, f"{game.winner} won in {guess_count_text(len(game.guesses))}!", game)
-        await share_game(room_id)
     elif len(game.guesses) == MAX_GUESSES:
         game.finished = True
         game.loser = sender.split(":", 1)[0].lstrip("@")
         await send_completion(room_id, f"Imagine failing today's Wordle, {game.loser}", game)
-        await share_game(room_id)
     else:
         await send(
             room_id,
@@ -294,9 +329,8 @@ def guess_count_text(count: int) -> str:
 async def send_completion(room_id: str, text: str, game: Game):
     await send(
         room_id,
-        f"{render_grid(game)}\n\n{text}\nThe result was shared to {SHARE_ROOM_ALIAS}.",
-        f"{render_html_grid(game)}<br><br>{text}<br>"
-        f"The result was shared to {SHARE_ROOM_ALIAS}.",
+        f"{render_grid(game)}\n\n{text}",
+        f"{render_html_grid(game)}<br><br>{text}",
     )
 
 
@@ -305,11 +339,22 @@ async def share_game(room_id: str, comment: str = ""):
     if not game or not game.finished:
         await send(room_id, "Finish today's Wordle before sharing the result.")
         return
-    comment = comment.replace("\n", " ").strip()
-    plain, html = render_share_message(game, comment)
+    
     try:
         response = await client.room_resolve_alias(SHARE_ROOM_ALIAS)
         target_room_id = response.room_id
+    except (LocalProtocolError, aiohttp.ClientError, ValueError) as error:
+        print(f"Could not resolve {SHARE_ROOM_ALIAS}: {error}")
+        await send(room_id, "I couldn't resolve the share room.")
+        return
+    
+    if room_id == target_room_id:
+        await send(room_id, "You cannot share the result from the share room itself.")
+        return
+    
+    comment = comment.replace("\n", " ").strip()
+    plain, html = render_share_message(game, comment)
+    try:
         await client.room_send(
             room_id=target_room_id,
             message_type="m.room.message",
