@@ -39,4 +39,4 @@ uv run python generate_emojis.py
 The 79 PNG files are written to `./emojis`. On startup, the bot uploads these
 assets to the Matrix media repository and uses their `mxc://` URLs in the
 formatted message, with shortcode text retained as a fallback for clients
-that do not render custom emoji.
+that do not render custom emoji. 
