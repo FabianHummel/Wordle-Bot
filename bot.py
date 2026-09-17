@@ -5,7 +5,9 @@ from io import BytesIO
 import os
 import sys
 import json
+import sqlite3
 import time
+import html
 from typing import Literal
 
 import aiohttp
@@ -241,6 +243,275 @@ def save_device_id(device_id):
         json.dump({"device_id": device_id}, f)
 
 
+# Leaderboard storage and helper functions (uses SQLite)
+DB_PATH = os.path.join(STORE_PATH, "leaderboard.db")
+
+
+def _normalize_user(sender: str) -> str:
+    return sender.split(":", 1)[0].lstrip("@")
+
+
+def _init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS players (
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE,
+            total_wins INTEGER DEFAULT 0,
+            total_losses INTEGER DEFAULT 0,
+            total_games INTEGER DEFAULT 0,
+            current_streak INTEGER DEFAULT 0,
+            highest_streak INTEGER DEFAULT 0,
+            last_finished_date TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS weekly_stats (
+            player_id INTEGER,
+            week_id TEXT,
+            wins INTEGER DEFAULT 0,
+            losses INTEGER DEFAULT 0,
+            PRIMARY KEY(player_id, week_id),
+            FOREIGN KEY(player_id) REFERENCES players(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def _row_to_dict(cur, row):
+    if not row:
+        return None
+    return {desc[0]: row[idx] for idx, desc in enumerate(cur.description)}
+
+
+def _get_or_create_player(conn, name: str) -> dict:
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM players WHERE name=?", (name,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO players(name) VALUES(?)", (name,))
+        conn.commit()
+        cur.execute("SELECT * FROM players WHERE name=?", (name,))
+        row = cur.fetchone()
+    return _row_to_dict(cur, row)
+
+
+def update_leaderboard_for_player(player: str, won: bool, finished_date: date):
+    name = player
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    p = _get_or_create_player(conn, name)
+    pid = p["id"]
+    total_wins = p.get("total_wins", 0) or 0
+    total_losses = p.get("total_losses", 0) or 0
+    current_streak = p.get("current_streak", 0) or 0
+    highest_streak = p.get("highest_streak", 0) or 0
+    last_finished = p.get("last_finished_date")
+
+    if won:
+        total_wins += 1
+    else:
+        total_losses += 1
+    total_games = total_wins + total_losses
+
+    # weekly
+    year, week, _ = finished_date.isocalendar()
+    week_id = f"{year}-{week:02d}"
+    cur.execute("SELECT wins, losses FROM weekly_stats WHERE player_id=? AND week_id=?", (pid, week_id))
+    wk = cur.fetchone()
+    if wk:
+        ww, wl = wk
+        ww = ww + 1 if won else ww
+        wl = wl + 1 if not won else wl
+        cur.execute("UPDATE weekly_stats SET wins=?, losses=? WHERE player_id=? AND week_id=?", (ww, wl, pid, week_id))
+    else:
+        ww = 1 if won else 0
+        wl = 0 if won else 1
+        cur.execute("INSERT INTO weekly_stats(player_id, week_id, wins, losses) VALUES(?,?,?,?)", (pid, week_id, ww, wl))
+
+    # streaks: only count one finished game per calendar day
+    if last_finished:
+        try:
+            last_date = datetime.fromisoformat(last_finished).date()
+        except Exception:
+            last_date = None
+    else:
+        last_date = None
+
+    if last_date == finished_date:
+        # already recorded today; do not change streak counts
+        pass
+    else:
+        if last_date and (finished_date - last_date).days == 1:
+            current_streak = (current_streak or 0) + 1
+        else:
+            current_streak = 1
+        if current_streak > (highest_streak or 0):
+            highest_streak = current_streak
+
+    cur.execute(
+        "UPDATE players SET total_wins=?, total_losses=?, total_games=?, current_streak=?, highest_streak=?, last_finished_date=? WHERE id=?",
+        (total_wins, total_losses, total_games, current_streak, highest_streak, finished_date.isoformat(), pid),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_player_stats(player: str) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM players WHERE name=?", (player,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return {
+            "total_wins": 0,
+            "total_losses": 0,
+            "total_games": 0,
+            "current_streak": 0,
+            "highest_streak": 0,
+            "last_finished_date": None,
+            "weekly": {},
+        }
+    p = _row_to_dict(cur, row)
+    # load current week
+    year, week, _ = datetime.now(timezone.utc).isocalendar()
+    week_id = f"{year}-{week:02d}"
+    cur.execute("SELECT wins, losses FROM weekly_stats WHERE player_id=? AND week_id=?", (p["id"], week_id))
+    wk = cur.fetchone()
+    if wk:
+        p["weekly"] = {week_id: {"wins": wk[0], "losses": wk[1]}}
+    else:
+        p["weekly"] = {}
+    conn.close()
+    return p
+
+
+def get_leaderboard_sorted() -> list:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM players")
+    rows = cur.fetchall()
+    players = []
+    for row in rows:
+        p = _row_to_dict(cur, row)
+        tg = p.get("total_games", 0) or 0
+        wins = p.get("total_wins", 0) or 0
+        win_rate = (wins / tg) if tg > 0 else 0
+        players.append((p["name"], win_rate, tg, p))
+    conn.close()
+    players.sort(key=lambda x: (-x[1], -x[2], -x[3].get("highest_streak", 0)))
+    return players
+
+
+async def show_leaderboard(room_id: str, sender: str):
+    user = _normalize_user(sender)
+    players = get_leaderboard_sorted()
+    if not players:
+        await send(room_id, "No leaderboard data yet.")
+        return
+
+    # build HTML table
+    rows_html = []
+    rows_text = []
+
+    # header
+    rows_html.append(
+        "<tr>"
+        "<th>Rank</th><th>Player</th>"
+        "<th>🌍 all time</th><th>⏱️ this week</th><th>⚡ streak</th><th>📈 highest streak</th>"
+        "</tr>"
+    )
+
+    def format_for_text(rank: int, name: str, all_cell: str, week_cell: str, current: int, best: int) -> str:
+        return f"{rank}. {name} | {all_cell} | {week_cell} | {current} | {best}"
+
+    # helper to get week cells
+    year, week, _ = datetime.now(timezone.utc).isocalendar()
+    week_id = f"{year}-{week:02d}"
+
+    # top 3
+    for idx, (name, rate, tg, p) in enumerate(players[:3], start=1):
+        wins = p.get("total_wins", 0) or 0
+        games = tg or 0
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT wins, losses FROM weekly_stats ws JOIN players pl ON ws.player_id=pl.id WHERE pl.name=? AND ws.week_id=?",
+            (name, week_id),
+        )
+        wk = cur.fetchone()
+        conn.close()
+        ww, wl = (wk if wk else (0, 0))
+        wgames = ww + wl
+        all_rate = (wins / games) if games > 0 else 0
+        week_rate = (ww / wgames) if wgames > 0 else 0
+        all_cell = f"{wins}/{games} ({all_rate:.0%})"
+        week_cell = f"{ww}/{wgames} ({week_rate:.0%})"
+        rows_html.append(
+            f"<tr><td>{idx}</td><td>{html.escape(name)}</td><td>{html.escape(all_cell)}</td><td>{html.escape(week_cell)}</td><td>{p.get('current_streak',0) or 0}</td><td>{p.get('highest_streak',0) or 0}</td></tr>"
+        )
+        rows_text.append(format_for_text(idx, name, all_cell, week_cell, p.get("current_streak", 0) or 0, p.get("highest_streak", 0) or 0))
+
+    # find user's rank
+    user_rank = None
+    user_data = None
+    for idx, (name, rate, tg, p) in enumerate(players, start=1):
+        if name == user:
+            user_rank = idx
+            user_data = (name, rate, tg, p)
+            break
+
+    if user_rank is None:
+        if len(players) > 3:
+            # divider row
+            rows_html.append("<tr><td colspan=7>—</td></tr>")
+            rows_text.append("-----")
+            rows_text.append(f"{user} — No finished games yet.")
+            rows_html.append(f"<tr><td colspan=7>{html.escape(user + ' — No finished games yet.')}</td></tr>")
+    elif user_rank > 3:
+        name, rate, tg, p = user_data
+        wins = p.get("total_wins", 0) or 0
+        games = p.get("total_games", 0) or 0
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT wins, losses FROM weekly_stats ws JOIN players pl ON ws.player_id=pl.id WHERE pl.name=? AND ws.week_id=?",
+            (name, week_id),
+        )
+        wk = cur.fetchone()
+        conn.close()
+        ww, wl = (wk if wk else (0, 0))
+        wgames = ww + wl
+        all_rate = (wins / games) if games > 0 else 0
+        week_rate = (ww / wgames) if wgames > 0 else 0
+        all_cell = f"{all_rate:.0%} ({wins}/{games})"
+        week_cell = f"{week_rate:.0%} ({ww}/{wgames})"
+        rows_html.append("<tr><td colspan=7>—</td></tr>")
+        rows_html.append(
+            f"<tr><td>{user_rank}</td><td>{html.escape(name)}</td><td>{html.escape(all_cell)}</td><td>{html.escape(week_cell)}</td><td>{games}</td><td>{p.get('current_streak',0) or 0}</td><td>{p.get('highest_streak',0) or 0}</td></tr>"
+        )
+        rows_text.append("-----")
+        rows_text.append(format_for_text(user_rank, name, all_cell, week_cell, games, p.get("current_streak", 0) or 0, p.get("highest_streak", 0) or 0))
+
+    html_table = "<table border=1 cellpadding=4 cellspacing=0>" + "".join(rows_html) + "</table>"
+    plain_text = "\n".join(["Rank. Player | 🌍 all time | ⏱️ this week | # games | ⚡ streak | 📈 highest streak"] + rows_text)
+
+    await send(room_id, plain_text, html_table)
+
+# initialize DB
+_init_db()
+
+
 async def message_callback(room: MatrixRoom, event: RoomMessageText):
     if event.sender == client.user_id:
         return
@@ -257,6 +528,8 @@ async def message_callback(room: MatrixRoom, event: RoomMessageText):
         await send(room.room_id, f"Hello {event.sender.split(':')[0]}, it is currently {time.ctime(time.time())}. Have a nice day!")
     elif event.body.lower().startswith("!guess"):
         await handle_guess(room.room_id, event.sender, event.body)
+    elif event.body.strip().lower() == "!leaderboard":
+        await show_leaderboard(room.room_id, event.sender)
     elif event.body.strip().lower() == "!share" or event.body.strip().lower().startswith("!share "):
         await share_game(room.room_id, event.body[len("!share"):].strip())
 
@@ -327,6 +600,14 @@ def guess_count_text(count: int) -> str:
 
 
 async def send_completion(room_id: str, text: str, game: Game):
+    # Update leaderboard for the finished player (winner or loser). Use UTC date.
+    finished_date = datetime.now(timezone.utc).date()
+    if game.winner:
+        # game.winner is stored as user localpart (no @ or domain)
+        update_leaderboard_for_player(game.winner, True, finished_date)
+    elif game.loser:
+        update_leaderboard_for_player(game.loser, False, finished_date)
+
     await send(
         room_id,
         f"{render_grid(game)}\n\n{text}",
