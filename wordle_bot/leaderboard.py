@@ -173,5 +173,71 @@ def get_leaderboard_sorted() -> list:
     return players
 
 
+def reset_database() -> str:
+    """Reset the entire database and return a summary of what was deleted."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    # Get all players and their stats before deletion
+    cur.execute("SELECT * FROM players")
+    rows = cur.fetchall()
+    players_data = [_row_to_dict(cur, row) for row in rows]
+    
+    # Delete all data
+    cur.execute("DELETE FROM weekly_stats")
+    cur.execute("DELETE FROM players")
+    conn.commit()
+    conn.close()
+    
+    # Format summary
+    summary = f"Database reset. Deleted {len(players_data)} players:\n"
+    for player in players_data:
+        wins = player.get("total_wins", 0) or 0
+        games = player.get("total_games", 0) or 0
+        summary += f"  - {player['name']}: {wins}/{games} wins\n"
+    
+    return summary
+
+
+def set_player_stats(player_id: str, global_wins: int, global_games: int, weekly_wins: int = 0, weekly_games: int = 0) -> str:
+    """Set player stats directly. Returns status message."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    player = _get_or_create_player(conn, player_id)
+    pid = player["id"]
+    
+    global_losses = global_games - global_wins
+    
+    # Update global stats
+    cur.execute(
+        "UPDATE players SET total_wins=?, total_losses=?, total_games=? WHERE id=?",
+        (global_wins, global_losses, global_games, pid),
+    )
+    
+    # Update weekly stats if provided
+    if weekly_games > 0:
+        year, week, _ = datetime.now(timezone.utc).isocalendar()
+        week_id = f"{year}-{week:02d}"
+        weekly_losses = weekly_games - weekly_wins
+        
+        cur.execute("SELECT * FROM weekly_stats WHERE player_id=? AND week_id=?", (pid, week_id))
+        if cur.fetchone():
+            cur.execute(
+                "UPDATE weekly_stats SET wins=?, losses=? WHERE player_id=? AND week_id=?",
+                (weekly_wins, weekly_losses, pid, week_id),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO weekly_stats(player_id, week_id, wins, losses) VALUES(?,?,?,?)",
+                (pid, week_id, weekly_wins, weekly_losses),
+            )
+    
+    conn.commit()
+    conn.close()
+    
+    return f"Updated {player_id}: {global_wins}/{global_games} global wins, {weekly_wins}/{weekly_games} weekly wins"
+
+
 # initialize DB on import
 _init_db()

@@ -36,11 +36,13 @@ DEVICE_NAME = os.getenv("MATRIX_DEVICE_NAME", "matrix-bot")
 STORE_PATH = os.getenv("STORE_PATH", "./store")
 DEVICE_ID_FILE = os.getenv("DEVICE_ID_FILE", "./device_id.json")
 SHARE_ROOM_ALIAS = os.getenv("WORDLE_SHARE_ROOM_ALIAS", "#general:dendrite.fabianmild.dev")
+ADMIN_ROOM_ALIAS = os.getenv("ADMIN_ROOM_ALIAS", "#admins:dendrite.fabianmild.dev")
 MAX_GUESSES = int(os.getenv("MAX_GUESSES", "6"))
 
 # runtime state
 client = None
 games: dict[str, core.Game] = {}
+admin_room_id: str | None = None
 
 
 def load_device_id():
@@ -88,7 +90,7 @@ async def show_leaderboard(room_id: str, sender: str):
     year, week, _ = datetime.now(timezone.utc).isocalendar()
     week_id = f"{year}-{week:02d}"
 
-    for idx, (name, rate, tg, p) in enumerate(players[:3], start=1):
+    for idx, (name, rate, tg, p) in enumerate(players):
         wins = p.get("total_wins", 0) or 0
         games = tg or 0
         # get weekly stats
@@ -157,9 +159,78 @@ async def show_leaderboard(room_id: str, sender: str):
     await send(room_id, plain_text, html_table)
 
 
+async def handle_admin_command(room_id: str, sender: str, body: str):
+    """Handle admin commands in the admin room."""
+    global admin_room_id
+    
+    # Verify this is the admin room
+    if room_id != admin_room_id:
+        return
+    
+    parts = body.split()
+    if len(parts) < 2 or parts[0].lower() != "!wordle":
+        return
+    
+    command = parts[1].lower()
+    
+    if command == "help":
+        help_text = "Admin Commands:\n!wordle help - Show this help message\n!wordle reset - Print leaderboard, confirm, and reset database\n!wordle set <player-id> <global-wins> <global-games> [weekly-wins] [weekly-games] - Set player stats"
+        help_html = "<h3>Admin Commands:</h3><ul><li><code>!wordle help</code> - Show this help message</li><li><code>!wordle reset</code> - Print leaderboard, confirm, and reset database</li><li><code>!wordle set &lt;player-id&gt; &lt;global-wins&gt; &lt;global-games&gt; [weekly-wins] [weekly-games]</code> - Set player stats</li></ul>"
+        await send(room_id, help_text, help_html)
+    
+    elif command == "reset":
+        # Show current leaderboard
+        await send(room_id, "Current leaderboard before reset:")
+        await show_leaderboard(room_id, sender)
+        confirm_text = "Type !wordle confirm-reset to confirm the reset."
+        confirm_html = "<p>⚠️ Type <code>!wordle confirm-reset</code> to confirm the reset.</p>"
+        await send(room_id, confirm_text, confirm_html)
+    
+    elif command == "confirm-reset":
+        summary = leaderboard.reset_database()
+        await send(room_id, f"Database reset complete.\n\n{summary}")
+    
+    elif command == "set":
+        if len(parts) < 5:
+            error_text = "Usage: !wordle set <player-id> <global-wins> <global-games> [weekly-wins] [weekly-games]"
+            error_html = "<code>Usage: !wordle set &lt;player-id&gt; &lt;global-wins&gt; &lt;global-games&gt; [weekly-wins] [weekly-games]</code>"
+            await send(room_id, error_text, error_html)
+            return
+        
+        try:
+            player_id = parts[2]
+            global_wins = int(parts[3])
+            global_games = int(parts[4])
+            weekly_wins = int(parts[5]) if len(parts) > 5 else 0
+            weekly_games = int(parts[6]) if len(parts) > 6 else 0
+            
+            if global_wins > global_games or weekly_wins > weekly_games:
+                await send(room_id, "Error: wins cannot exceed games.")
+                return
+            
+            result = leaderboard.set_player_stats(player_id, global_wins, global_games, weekly_wins, weekly_games)
+            await send(room_id, result)
+        except ValueError:
+            await send(room_id, "Error: All numbers must be valid integers.")
+    
+    else:
+        await send(room_id, f"Unknown command: `{command}`. Use `!wordle help` for available commands.")
+
+
+
 async def message_callback(room: MatrixRoom, event: RoomMessageText):
+    global admin_room_id
+    
     if event.sender == client.user_id:
         return
+    
+    # Set admin_room_id on first message from admin room
+    if admin_room_id is None:
+        try:
+            response = await client.room_resolve_alias(ADMIN_ROOM_ALIAS)
+            admin_room_id = response.room_id
+        except Exception:
+            pass
 
     today = datetime.now(timezone.utc).date()
     # reset per-day state when day changes
@@ -170,14 +241,20 @@ async def message_callback(room: MatrixRoom, event: RoomMessageText):
     print(f"[{room.display_name}] {event.sender}: {event.body}")
 
     body = event.body.strip()
+    
+    # Check for admin commands first
+    if body.lower().startswith("!wordle") and room.room_id == admin_room_id:
+        await handle_admin_command(room.room_id, event.sender, body)
+        return
+    
     if body.startswith("!touch"):
         await send(room.room_id, f"Hello {event.sender.split(':')[0]}, it is currently {time.ctime(time.time())}. Have a nice day!")
     elif body.lower().startswith("!guess"):
         await handle_guess(room.room_id, event.sender, body)
     elif body.lower() == "!leaderboard":
         await show_leaderboard(room.room_id, event.sender)
-    elif body.lower().startswith("!share"):
-        await share_game(room.room_id, body[len("!share"):].strip())
+    elif body.lower().startswith("!nice"):
+        await share_game(room.room_id, body[len("!nice"):].strip())
 
 
 async def handle_guess(room_id: str, sender: str, body: str):
