@@ -253,8 +253,8 @@ async def message_callback(room: MatrixRoom, event: RoomMessageText):
         await handle_guess(room.room_id, event.sender, body)
     elif body.lower() == "!leaderboard":
         await show_leaderboard(room.room_id, event.sender)
-    elif body.lower().startswith("!nice"):
-        await share_game(room.room_id, body[len("!nice"):].strip())
+    elif body.lower().startswith("!share"):
+        await share_game(room.room_id, body[len("!share"):].strip())
 
 
 async def handle_guess(room_id: str, sender: str, body: str):
